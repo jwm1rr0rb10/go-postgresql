@@ -84,14 +84,14 @@ func TestNewClientAttemptTimeoutDoesNotHang(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }() // held open until the test ends
 		}
 	}()
 

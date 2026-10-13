@@ -94,12 +94,6 @@ func TestWithIntervalCheck(t *testing.T) {
 	}
 }
 
-func (m *mockHealthChecker) getName() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.name
-}
-
 func (m *mockHealthChecker) getStatus() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()

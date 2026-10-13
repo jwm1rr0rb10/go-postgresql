@@ -3,6 +3,7 @@ package psql
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func healthyClient(name string, healthy bool) *Client {
@@ -52,6 +53,31 @@ func TestClusterReplicaRouting(t *testing.T) {
 	r3.healthy.Store(false)
 	if c.Replica() != primary {
 		t.Fatal("must fall back to the primary when no replica is healthy")
+	}
+}
+
+func TestClusterSkipsLaggingReplica(t *testing.T) {
+	primary := healthyClient("primary", true)
+	lagging, fresh := healthyClient("lagging", true), healthyClient("fresh", true)
+	for _, r := range []*Client{lagging, fresh} {
+		r.maxLag = time.Second
+	}
+	lagging.lag.Store(int64(5 * time.Second))
+	fresh.lag.Store(int64(100 * time.Millisecond))
+
+	c, err := NewCluster(primary, lagging, fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 10 {
+		if got := c.Replica(); got != fresh {
+			t.Fatalf("Replica() = %s, want fresh", got.Name())
+		}
+	}
+
+	fresh.lag.Store(int64(2 * time.Second))
+	if c.Replica() != primary {
+		t.Fatal("must fall back to the primary when every replica lags")
 	}
 }
 

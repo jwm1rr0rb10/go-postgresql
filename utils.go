@@ -1,10 +1,9 @@
 package psql
 
 import (
+	"errors"
 	"fmt"
 	"strings"
-
-	"github.com/jwm1rr0rb10/go-errors"
 
 	"github.com/jackc/pgerrcode"
 )

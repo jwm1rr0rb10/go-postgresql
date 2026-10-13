@@ -66,7 +66,7 @@ func TestPoolTuningOptions(t *testing.T) {
 		WithMaxConnIdleTime(3*time.Minute),
 		WithHealthCheckPeriod(15*time.Second),
 		WithStatementTimeout(1500*time.Millisecond),
-		WithApplicationName("kalipso"),
+		WithApplicationName("psql-test"),
 		WithRuntimeParam("lock_timeout", "2000"),
 		WithAfterConnect(afterConnect),
 		WithPrepareConn(prepare),
@@ -82,7 +82,7 @@ func TestPoolTuningOptions(t *testing.T) {
 		t.Fatalf("idle/health = %v/%v", p.MaxConnIdleTime, p.HealthCheckPeriod)
 	}
 	rp := p.ConnConfig.RuntimeParams
-	if rp["statement_timeout"] != "1500" || rp["application_name"] != "kalipso" || rp["lock_timeout"] != "2000" {
+	if rp["statement_timeout"] != "1500" || rp["application_name"] != "psql-test" || rp["lock_timeout"] != "2000" {
 		t.Fatalf("runtime params = %v", rp)
 	}
 	if p.AfterConnect == nil || p.PrepareConn == nil {

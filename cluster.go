@@ -6,11 +6,15 @@ import (
 
 // Cluster routes work between a primary and read replicas.
 //
-// Replica() round-robins over replicas whose last background ping succeeded
-// and falls back to the primary when none is healthy. Health is refreshed
-// every health-check interval (WithIntervalCheck), so a replica can stay in
-// rotation for up to one interval after it fails. Replication lag is not
-// tracked: read-your-writes paths must use Primary().
+// Replica() round-robins over healthy replicas and falls back to the primary
+// when none is healthy. A replica leaves rotation after WithFailureThreshold
+// consecutive failed pings, so it can stay in rotation for up to
+// threshold × WithIntervalCheck after it fails. A replica whose pool is merely
+// saturated stays in rotation.
+//
+// Replicas created with WithMaxReplicationLag also leave rotation while their
+// measured lag exceeds the limit. Without it lag is not tracked, and either
+// way read-your-writes paths must use Primary().
 type Cluster struct {
 	primary  *Client
 	replicas []*Client
@@ -46,7 +50,7 @@ func (c *Cluster) Replica() *Client {
 	}
 	start := c.next.Add(1)
 	for i := range n {
-		if r := c.replicas[(start+i)%n]; r.Healthy() {
+		if r := c.replicas[(start+i)%n]; r.Healthy() && r.withinLag() {
 			return r
 		}
 	}

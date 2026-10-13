@@ -1,7 +1,7 @@
 # PSQL
 **Production-Ready PostgreSQL Client with Retries, Health Checks and High-Load Optimizations for Go Services**
 
-`psql` is a lightweight, battle-tested wrapper around [`github.com/jackc/pgx/v5/pgxpool`](https://github.com/jackc/pgx) that provides a clean, configurable and highly reliable PostgreSQL client.  
+`psql` is a lightweight wrapper around [`github.com/jackc/pgx/v5/pgxpool`](https://github.com/jackc/pgx) that provides a clean, configurable and highly reliable PostgreSQL client.  
 It includes smart connection pooling, automatic retries with jitter, dual health monitoring, centralized error handling and production-grade defaults — everything you need for high-load backends without boilerplate.
 
 It supports:
@@ -12,13 +12,13 @@ It supports:
 - Graceful shutdown
 - Pretty SQL logging
 - Safe DSN builder
-- Binary query execution mode
+- Configurable query execution mode (PgBouncer-safe)
 
 Perfect for REST APIs, gRPC services, microservices or any backend that needs stable and observable PostgreSQL access.
 
 ## Features
 - **Zero boilerplate** configuration with powerful `Option` pattern
-- Production-optimized defaults (50/10 connections, 1h lifetime, etc.)
+- Production-optimized defaults (20/0 connections, 1h lifetime with jitter, etc.)
 - Automatic retries on connection failures with jitter
 - Two-level health monitoring (custom interface + metrics)
 - Centralized error wrappers (`ErrCommit`, `ErrDoQuery`, etc.)
@@ -31,7 +31,7 @@ Perfect for REST APIs, gRPC services, microservices or any backend that needs st
 
 ## Installation
 ```bash
-go get github.com/jwm1rr0rb10/libraries/backend/golang/postgresql
+go get github.com/jwm1rr0rb10/go-postgresql
 ```
 
 ---
@@ -39,8 +39,8 @@ go get github.com/jwm1rr0rb10/libraries/backend/golang/postgresql
 The library depends on:
 
 - github.com/jackc/pgx/v5
-- github.com/jackc/pgx/v5/pgxpool
-- (optional) your own HealthChecker and metrics implementation
+- github.com/prometheus/client_golang
+- go.opentelemetry.io/otel
 
 After adding the module, run:
 ```bash
@@ -58,8 +58,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
-	"github.com/jwm1rr0rb10/libraries/backend/golang/postgresql"
+	"github.com/jackc/pgx/v5"
+	psql "github.com/jwm1rr0rb10/go-postgresql"
 )
 
 func main() {
@@ -112,15 +114,23 @@ func (h *MyHealth) SetStatus(name string, status bool, details interface{}) { /*
 cfg, _ := psql.NewConfig(dsn,
 	psql.WithHealthChecker("postgres-main", &MyHealth{}),
 	psql.WithIntervalCheck(15*time.Second),
+	psql.WithFailureThreshold(3), // consecutive failed pings before "unhealthy"
 )
 ```
+
+The client turns unhealthy after `WithFailureThreshold` consecutive failed
+pings (default 3) and recovers on the first success. A ping that times out
+waiting on a fully busy pool leaves the status unchanged: saturation is not an
+outage, and reporting it as one would drop replicas from `Cluster` rotation or
+fail readiness probes exactly under peak load. Health pings bypass query traces
+and latency metrics.
 
 ---
 
 ## Core Concepts
 ### Config + Option pattern
 All configuration is done through `NewConfig(dsn, options...)`.
-You can override retries, pool settings, health checks, binary mode, etc.
+You can override retries, pool settings, health checks, query exec mode, etc.
 
 ### HealthChecker interface
 
@@ -165,6 +175,9 @@ clean := psql.PrettySQL(`
 | WithQueryExecMode          | pgx query exec mode (CacheDescribe/Exec for PgBouncer) |
 | WithHealthChecker          | Attach custom health reporter           |
 | WithIntervalCheck          | Set health check interval               |
+| WithFailureThreshold       | Failed pings before reporting unhealthy |
+| WithRegisterer             | Custom Prometheus registry (nil disables metrics) |
+| WithMaxReplicationLag      | Lag-aware replica routing in Cluster    |
 | WithConnectionPool         | Configure pool size and lifetime        |
 | "ErrCommit, ErrDoQuery..." | Error wrappers with context             |
 | IsErrUniqueViolation       | Check for unique violation              |
@@ -238,6 +251,8 @@ Built in, no extra setup:
 - OpenTelemetry client spans for queries, batches and COPY via the global
   TracerProvider. `WithTracing(false)`, `WithTraceSQL(false)` to tune;
   `WithQueryTracer` adds your own pgx tracer.
+- Metrics go to `prometheus.DefaultRegisterer`; pass
+  `psql.WithRegisterer(reg)` to use your own registry, or `nil` to disable them.
 
 ### Transactions
 ```go
@@ -254,17 +269,31 @@ cluster, _ := psql.NewCluster(primary, replica1, replica2)
 cluster.Replica().Query(ctx, ...) // healthy replica round-robin, falls back to primary
 cluster.Primary().Exec(ctx, ...)  // writes and read-your-writes
 ```
-Replication lag is not tracked.
+Create replica clients with `psql.WithMaxReplicationLag(5*time.Second)` to
+measure replay lag on every health check: `Replica()` skips a replica while it
+lags more than that, and the lag is exported as
+`postgres_replication_lag_seconds`. Without the option lag is not tracked.
 
 ### Testability
 Depend on `psql.Querier` (satisfied by `*Client`, `pgx.Tx`, `*pgx.Conn`) and
 `psql.TxRunner` instead of `*psql.Client` to mock the database.
 
 ### Benchmarks
-`go test -run '^$' -bench . ./pkg/golang/postgresql` (`-short` skips the
+`go test -run '^$' -bench . ./...` (`-short` skips the
 embedded-PostgreSQL round-trip benchmark).
 
 ## Changelog
+
+### Unreleased
+
+- Health monitor: unhealthy only after `WithFailureThreshold` consecutive failures (default 3); a saturated pool no longer counts as a failure
+- Health pings no longer produce spans and `query="other"` latency samples
+- Fixed: calling `Close` twice (e.g. `Cluster.Close` plus the client) could mark a database still used by another client unavailable
+- OpenTelemetry instrumentation scope renamed to `github.com/jwm1rr0rb10/go-postgresql`
+- `WithRegisterer` for a custom Prometheus registry (or `nil` to disable metrics)
+- `WithMaxReplicationLag`: lag-aware `Cluster.Replica()` routing and `postgres_replication_lag_seconds`
+- `DoWithAttempts` keeps the last error when the context ends (`errors.Is` matches both)
+- Dropped the `go-errors` and `go-metrics` dependencies (and with them gRPC): stdlib `errors` and `prometheus` directly
 
 ### 1.2.0
 

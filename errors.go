@@ -1,9 +1,8 @@
 package psql
 
 import (
+	"errors"
 	"fmt"
-
-	"github.com/jwm1rr0rb10/go-errors"
 )
 
 var (

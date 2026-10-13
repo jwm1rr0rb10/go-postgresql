@@ -237,7 +237,7 @@ func TestIntegration(t *testing.T) {
 		}
 
 		reg := prometheus.NewPedanticRegistry()
-		reg.MustRegister(poolStats)
+		reg.MustRegister(defaultMetrics().pool)
 		families, err := reg.Gather()
 		if err != nil {
 			t.Fatal(err)
@@ -272,6 +272,80 @@ func TestIntegration(t *testing.T) {
 		replica.Close()
 		if cluster.Replica() != db {
 			t.Fatal("closed replica must fall back to the primary")
+		}
+	})
+
+	t.Run("saturated pool keeps the client healthy", func(t *testing.T) {
+		checker := &mockHealthChecker{}
+		c := newClient(t,
+			WithPoolName("it-saturated"),
+			WithConnectionPool(1, 0, time.Hour),
+			WithHealthChecker("db", checker),
+			WithFailureThreshold(1),
+		)
+		conn, err := c.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Release()
+
+		details := func() interface{} {
+			checker.mu.Lock()
+			defer checker.mu.Unlock()
+			return checker.details
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for details() != "pool saturated, status unchanged" {
+			if time.Now().After(deadline) {
+				t.Fatalf("saturation not detected, last details: %v", details())
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if !c.Healthy() || !checker.getStatus() {
+			t.Fatal("a saturated pool must not be reported unhealthy")
+		}
+	})
+
+	t.Run("replication lag on a primary reads as zero", func(t *testing.T) {
+		reg := prometheus.NewPedanticRegistry()
+		replica := newClient(t, WithPoolName("it-lag"), WithMaxReplicationLag(time.Second), WithRegisterer(reg))
+		replica.lag.Store(int64(time.Hour)) // must be overwritten by the next check
+
+		deadline := time.Now().Add(5 * time.Second)
+		for replica.ReplicationLag() != 0 {
+			if time.Now().After(deadline) {
+				t.Fatalf("lag not measured: %v", replica.ReplicationLag())
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		cluster, err := NewCluster(db, replica)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cluster.Replica() != replica {
+			t.Fatal("a replica within the lag limit must serve reads")
+		}
+
+		families, err := reg.Gather()
+		if err != nil {
+			t.Fatal(err)
+		}
+		names := map[string]bool{}
+		for _, f := range families {
+			names[f.GetName()] = true
+		}
+		for _, n := range []string{"postgres_replication_lag_seconds", "postgres_pool_acquires_total", "postgres_availability"} {
+			if !names[n] {
+				t.Fatalf("%s missing from the custom registerer: %v", n, names)
+			}
+		}
+	})
+
+	t.Run("health pings stay out of query metrics", func(t *testing.T) {
+		newClient(t, WithPoolName("it-quiet"))
+		time.Sleep(200 * time.Millisecond) // ~10 health ticks
+		if n := histogramCount(t, "it-quiet", "other", "ok"); n != 0 {
+			t.Fatalf("health pings recorded as queries: %d", n)
 		}
 	})
 }

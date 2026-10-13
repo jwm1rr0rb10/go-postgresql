@@ -2,12 +2,10 @@ package psql
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/jwm1rr0rb10/go-errors"
-	"github.com/jwm1rr0rb10/go-metrics"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/multitracer"
@@ -18,16 +16,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-const instrumentationName = "kalipso/app/pkg/golang/postgresql"
-
-var queryDuration = metrics.NewHistogramVec(
-	metrics.HistogramOpts{
-		Name:    "postgres_query_duration_seconds",
-		Help:    "PostgreSQL query latency by pool, query name and outcome.",
-		Buckets: []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
-	},
-	[]string{"pool", "query", "status"},
-)
+const instrumentationName = "github.com/jwm1rr0rb10/go-postgresql"
 
 type queryNameKey struct{}
 
@@ -110,6 +99,7 @@ func queryStatus(err error) string {
 
 // observer is a pgx tracer that records query latency and, optionally, spans.
 type observer struct {
+	metrics  *metricSet
 	pool     string
 	tracer   trace.Tracer
 	tracing  bool
@@ -127,7 +117,7 @@ type observerState struct {
 
 // buildTracer combines the built-in observer with user tracers and any tracer
 // already set on the pgx config.
-func buildTracer(cfg *Config, existing pgx.QueryTracer) pgx.QueryTracer {
+func buildTracer(cfg *Config, m *metricSet, existing pgx.QueryTracer) pgx.QueryTracer {
 	l := labelsFromConfig(cfg)
 	attrs := []attribute.KeyValue{
 		attribute.String("db.system.name", "postgresql"),
@@ -140,6 +130,7 @@ func buildTracer(cfg *Config, existing pgx.QueryTracer) pgx.QueryTracer {
 	}
 
 	tracers := []pgx.QueryTracer{&observer{
+		metrics:  m,
 		pool:     cfg.poolName,
 		tracer:   otel.Tracer(instrumentationName),
 		tracing:  cfg.tracing,
@@ -180,7 +171,7 @@ func (o *observer) end(ctx context.Context, err error, rows int64) {
 		return
 	}
 	status := queryStatus(err)
-	queryDuration.WithLabelValues(o.pool, st.name, status).Observe(time.Since(st.start).Seconds())
+	o.metrics.queryDuration.WithLabelValues(o.pool, st.name, status).Observe(time.Since(st.start).Seconds())
 
 	if st.span == nil {
 		return
@@ -254,9 +245,6 @@ type poolStatsCollector struct {
 }
 
 var (
-	poolStats         = &poolStatsCollector{clients: map[*Client]struct{}{}}
-	poolStatsRegister sync.Once
-
 	poolLabels = []string{"pool", "host", "database"}
 
 	descConns = prometheus.NewDesc("postgres_pool_connections",
@@ -277,22 +265,20 @@ var (
 		"Connections opened.", poolLabels, nil)
 	descDestroyed = prometheus.NewDesc("postgres_pool_destroyed_connections_total",
 		"Connections closed by the pool, by reason.", append(poolLabels, "reason"), nil)
+	descReplicationLag = prometheus.NewDesc("postgres_replication_lag_seconds",
+		"Replay lag of a replica as of the last health check (see WithMaxReplicationLag).", poolLabels, nil)
 )
 
-func registerPoolStats(c *Client) {
-	// Registered lazily so a metrics.SetRegisterer call during startup is honored.
-	poolStatsRegister.Do(func() {
-		_ = metrics.Registerer.Register(poolStats)
-	})
-	poolStats.mu.Lock()
-	defer poolStats.mu.Unlock()
-	poolStats.clients[c] = struct{}{}
+func (p *poolStatsCollector) add(c *Client) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.clients[c] = struct{}{}
 }
 
-func unregisterPoolStats(c *Client) {
-	poolStats.mu.Lock()
-	defer poolStats.mu.Unlock()
-	delete(poolStats.clients, c)
+func (p *poolStatsCollector) remove(c *Client) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.clients, c)
 }
 
 type poolStatsKey struct{ pool, host, database string }
@@ -302,12 +288,15 @@ type poolStatsSum struct {
 	acquires, empty, canceled, newConns   int64
 	lifetimeDestroyed, idleDestroyed      int64
 	acquireDuration, emptyAcquireDuration time.Duration
+	lag                                   time.Duration
+	lagTracked                            bool
 }
 
 func (p *poolStatsCollector) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{
 		descConns, descMaxConns, descAcquires, descAcquireSeconds, descEmptyAcquires,
 		descEmptyAcquireWait, descCanceledAcquires, descNewConns, descDestroyed,
+		descReplicationLag,
 	} {
 		ch <- d
 	}
@@ -336,6 +325,10 @@ func (p *poolStatsCollector) Collect(ch chan<- prometheus.Metric) {
 		s.idleDestroyed += st.MaxIdleDestroyCount()
 		s.acquireDuration += st.AcquireDuration()
 		s.emptyAcquireDuration += st.EmptyAcquireWaitTime()
+		if c.maxLag > 0 {
+			s.lagTracked = true
+			s.lag = max(s.lag, c.ReplicationLag())
+		}
 	}
 	p.mu.Unlock()
 
@@ -359,5 +352,8 @@ func (p *poolStatsCollector) Collect(ch chan<- prometheus.Metric) {
 		counter(descNewConns, float64(s.newConns))
 		counter(descDestroyed, float64(s.lifetimeDestroyed), "max_lifetime")
 		counter(descDestroyed, float64(s.idleDestroyed), "max_idle")
+		if s.lagTracked {
+			gauge(descReplicationLag, s.lag.Seconds())
+		}
 	}
 }

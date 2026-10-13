@@ -2,10 +2,9 @@ package psql
 
 import (
 	"context"
+	"errors"
 	"math/rand/v2"
 	"time"
-
-	"github.com/jwm1rr0rb10/go-errors"
 
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"

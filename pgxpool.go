@@ -2,35 +2,41 @@ package psql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 const (
 	// Pool defaults are sized for many replicas of a service sharing one
 	// PostgreSQL: no idle connections are pinned per instance (min=0) and the
 	// per-instance ceiling stays modest. Size explicitly for heavy workloads.
-	defaultMaxConnections  = 20
-	defaultMinConnections  = 0
-	defaultPoolName        = "default"
-	defaultTxMaxAttempts   = 3
-	defaultMaxRetryDelay   = 30 * time.Second
-	defaultConnLifetime    = time.Hour
-	defaultMaxAttempts     = 5
-	defaultIntervalCheck   = 10 * time.Second
-	defaultHealthCheckName = "postgresql"
-	baseRetryDelay         = 100 * time.Millisecond
-	jitterFactor           = 0.2
-	pingTimeout            = 2 * time.Second
+	defaultMaxConnections   = 20
+	defaultMinConnections   = 0
+	defaultPoolName         = "default"
+	defaultTxMaxAttempts    = 3
+	defaultMaxRetryDelay    = 30 * time.Second
+	defaultConnLifetime     = time.Hour
+	defaultMaxAttempts      = 5
+	defaultIntervalCheck    = 10 * time.Second
+	defaultFailureThreshold = 3
+	defaultHealthCheckName  = "postgresql"
+	baseRetryDelay          = 100 * time.Millisecond
+	jitterFactor            = 0.2
+	pingTimeout             = 2 * time.Second
 	// connectAttemptTimeout bounds a single startup ping when the DSN sets no
 	// connect_timeout, so one attempt cannot hang for the whole parent context.
 	connectAttemptTimeout = 5 * time.Second
@@ -52,9 +58,10 @@ type Config struct {
 	maxAttempts int
 	maxDelay    time.Duration
 	health      struct {
-		checker       HealthChecker
-		intervalCheck time.Duration
-		name          string
+		checker          HealthChecker
+		intervalCheck    time.Duration
+		failureThreshold int
+		name             string
 	}
 	poolSettings struct {
 		maxConns        int32
@@ -69,6 +76,8 @@ type Config struct {
 	traceSQL      bool
 	tracers       []pgx.QueryTracer
 	txMaxAttempts int
+	registerer    prometheus.Registerer
+	maxLag        time.Duration
 }
 
 // Option configures the PostgreSQL client.
@@ -153,6 +162,7 @@ func NewConfig(dsn string, options ...Option) (*Config, error) {
 		tracing:       true,
 		traceSQL:      true,
 		txMaxAttempts: defaultTxMaxAttempts,
+		registerer:    prometheus.DefaultRegisterer,
 	}
 
 	// Precedence: package defaults < pool_* parameters in the DSN < options.
@@ -225,6 +235,9 @@ func (c *Config) applyDefaults() {
 	if c.health.intervalCheck <= 0 {
 		c.health.intervalCheck = defaultIntervalCheck
 	}
+	if c.health.failureThreshold <= 0 {
+		c.health.failureThreshold = defaultFailureThreshold
+	}
 }
 
 // Validate checks whether the configuration can be used to create a client.
@@ -292,10 +305,67 @@ type Client struct {
 	healthChecker HealthChecker
 	healthName    string
 	labels        availabilityLabels
-	healthy       atomic.Bool // result of the last background ping
+	healthy       atomic.Bool // health as seen by the background monitor
 	txMaxAttempts int
 	cancelHealth  context.CancelFunc // For graceful shutdown of health checks
 	healthDone    chan struct{}      // Closed when the monitor goroutine exits
+	closeOnce     sync.Once
+	metrics       *metricSet
+	maxLag        time.Duration // 0 disables replication lag checks
+	lag           atomic.Int64  // last measured replication lag, ns
+}
+
+// errPoolSaturated reports a health probe that timed out waiting for a
+// connection while every connection was in use: the pool is busy, which says
+// nothing about whether the database is up.
+var errPoolSaturated = errors.New("pool saturated")
+
+// replicationLagSQL returns the replay delay in seconds: 0 when everything
+// received has been replayed, and also on a primary, where both functions
+// return NULL.
+const replicationLagSQL = `SELECT COALESCE(CASE
+	WHEN pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn() THEN 0
+	ELSE EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp())
+END, 0)`
+
+// probe pings the database through a pooled connection. When lag is non-nil
+// it measures replication lag instead of a bare ping. It talks to pgconn
+// directly so health checks stay out of query traces and latency metrics.
+func probe(ctx context.Context, pool *pgxpool.Pool, lag *time.Duration) error {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			if st := pool.Stat(); st.AcquiredConns() >= st.MaxConns() {
+				return errPoolSaturated
+			}
+		}
+		return err
+	}
+	defer conn.Release()
+	if lag == nil {
+		return conn.Conn().PgConn().Ping(ctx)
+	}
+	d, err := replicationLag(ctx, conn.Conn().PgConn())
+	if err != nil {
+		return err
+	}
+	*lag = d
+	return nil
+}
+
+func replicationLag(ctx context.Context, pgConn *pgconn.PgConn) (time.Duration, error) {
+	results, err := pgConn.Exec(ctx, replicationLagSQL).ReadAll()
+	if err != nil {
+		return 0, err
+	}
+	if len(results) != 1 || len(results[0].Rows) != 1 || len(results[0].Rows[0]) != 1 {
+		return 0, errors.New("replication lag query: unexpected result shape")
+	}
+	secs, err := strconv.ParseFloat(string(results[0].Rows[0][0]), 64)
+	if err != nil {
+		return 0, fmt.Errorf("replication lag query: %w", err)
+	}
+	return time.Duration(secs * float64(time.Second)), nil
 }
 
 // NewClient creates a new PostgreSQL connection pool with highload optimizations,
@@ -305,10 +375,11 @@ func NewClient(ctx context.Context, cfg *Config) (*Client, error) {
 		return nil, err
 	}
 	r := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0))
+	m := metricsFor(cfg.registerer)
 
 	// Instrument a copy so cfg stays reusable for further clients.
 	pgxCfg := cfg.pgxConfig.Copy()
-	pgxCfg.ConnConfig.Tracer = buildTracer(cfg, pgxCfg.ConnConfig.Tracer)
+	pgxCfg.ConnConfig.Tracer = buildTracer(cfg, m, pgxCfg.ConnConfig.Tracer)
 
 	pool, err := pgxpool.NewWithConfig(ctx, pgxCfg)
 	if err != nil {
@@ -323,7 +394,7 @@ func NewClient(ctx context.Context, cfg *Config) (*Client, error) {
 	pingErr := DoWithAttempts(ctx, r, func() error {
 		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
 		defer cancel()
-		return pool.Ping(attemptCtx)
+		return probe(attemptCtx, pool, nil)
 	}, cfg.maxAttempts, cfg.maxDelay)
 	if pingErr != nil {
 		pool.Close()
@@ -342,16 +413,18 @@ func NewClient(ctx context.Context, cfg *Config) (*Client, error) {
 		labels:        labelsFromConfig(cfg),
 		cancelHealth:  cancel,
 		healthDone:    make(chan struct{}),
+		metrics:       m,
+		maxLag:        cfg.maxLag,
 	}
 
 	client.healthy.Store(true)
-	acquireAvailability(client.labels)
-	setAvailability(client.labels, true)
-	registerPoolStats(client)
+	m.acquireAvailability(client.labels)
+	m.setAvailability(client.labels, true)
+	m.pool.add(client)
 
 	go func() {
 		defer close(client.healthDone)
-		client.monitor(healthCtx, cfg.HealthCheckInterval())
+		client.monitor(healthCtx, cfg.HealthCheckInterval(), cfg.health.failureThreshold)
 	}()
 
 	return client, nil
@@ -360,10 +433,17 @@ func NewClient(ctx context.Context, cfg *Config) (*Client, error) {
 // monitor periodically pings the database and reports the result to both the
 // availability gauge and the optional health checker until ctx is cancelled.
 // A single goroutine serves both consumers so each tick costs one ping.
-func (c *Client) monitor(ctx context.Context, interval time.Duration) {
+//
+// The client turns unhealthy only after failureThreshold consecutive failed
+// pings, and one success restores it. A saturated pool leaves the status
+// unchanged: under load the database is busy, not down, and reporting it
+// unhealthy would shift traffic away or get the service restarted exactly when
+// it is busiest.
+func (c *Client) monitor(ctx context.Context, interval time.Duration, failureThreshold int) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	failures := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -372,30 +452,59 @@ func (c *Client) monitor(ctx context.Context, interval time.Duration) {
 			}
 			return
 		case <-ticker.C:
+			var lag *time.Duration
+			if c.maxLag > 0 {
+				lag = new(time.Duration)
+			}
 			pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
-			err := c.Ping(pingCtx)
+			err := probe(pingCtx, c.Pool, lag)
 			cancel()
+			if err == nil && lag != nil {
+				c.lag.Store(int64(*lag))
+			}
 
-			status := err == nil
+			var details string
+			switch {
+			case err == nil:
+				failures = 0
+				details = "connection healthy"
+			case errors.Is(err, errPoolSaturated):
+				details = "pool saturated, status unchanged"
+			default:
+				failures++
+				details = fmt.Sprintf("connection error (%d/%d): %v", failures, failureThreshold, err)
+			}
+
+			status := c.healthy.Load()
+			if err == nil {
+				status = true
+			} else if failures >= failureThreshold {
+				status = false
+			}
 			c.healthy.Store(status)
-			setAvailability(c.labels, status)
-			if c.healthChecker == nil {
-				continue
+			c.metrics.setAvailability(c.labels, status)
+			if c.healthChecker != nil {
+				c.healthChecker.SetStatus(c.healthName, status, details)
 			}
-			details := "connection healthy"
-			if !status {
-				details = fmt.Sprintf("connection error: %v", err)
-			}
-			c.healthChecker.SetStatus(c.healthName, status, details)
 		}
 	}
+}
+
+// ReplicationLag returns the replay lag measured by the last successful health
+// check. It is always 0 unless WithMaxReplicationLag is set.
+func (c *Client) ReplicationLag() time.Duration { return time.Duration(c.lag.Load()) }
+
+// withinLag reports whether the client may serve replica reads in a Cluster.
+func (c *Client) withinLag() bool {
+	return c.maxLag <= 0 || c.ReplicationLag() <= c.maxLag
 }
 
 // Name returns the pool name used in metrics and traces (see WithPoolName).
 func (c *Client) Name() string { return c.name }
 
-// Healthy reports the result of the most recent background ping. It is
-// refreshed every health-check interval and turns false once Close starts.
+// Healthy reports the client's health as seen by the background monitor (see
+// WithFailureThreshold). It is refreshed every health-check interval and turns
+// false once Close starts.
 func (c *Client) Healthy() bool { return c.healthy.Load() }
 
 // DoWithAttempts implements advanced retry logic with exponential backoff and jitter.
@@ -416,7 +525,7 @@ func DoWithAttempts(
 		}
 
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return contextError(ctx, lastErr)
 		}
 
 		// No need to wait after the final attempt.
@@ -438,11 +547,17 @@ func DoWithAttempts(
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return contextError(ctx, lastErr)
 		case <-time.After(backoff):
 		}
 	}
 	return fmt.Errorf("operation failed after %d attempts: %w", maxAttempts, lastErr)
+}
+
+// contextError reports why retrying stopped without losing the failure that
+// caused the retries: both match errors.Is.
+func contextError(ctx context.Context, lastErr error) error {
+	return fmt.Errorf("%w (last error: %w)", ctx.Err(), lastErr)
 }
 
 // addJitter applies random jitter to duration to avoid thundering herd.
@@ -471,12 +586,16 @@ func (c *DSNConfig) ToPostgresDSN() string {
 	return u.String()
 }
 
-// Close gracefully terminates the connection pool and health checks.
+// Close gracefully terminates the connection pool and health checks. It is
+// safe to call more than once, e.g. via both Cluster.Close and the client.
 func (c *Client) Close() {
 	if c == nil {
 		return
 	}
+	c.closeOnce.Do(c.close)
+}
 
+func (c *Client) close() {
 	// Stop the monitor goroutine first and wait for it to report the final
 	// status, so callers observe "unhealthy" as soon as Close returns and no
 	// ping races with the pool shutdown below.
@@ -486,8 +605,10 @@ func (c *Client) Close() {
 	}
 	if c.healthDone != nil {
 		<-c.healthDone
-		releaseAvailability(c.labels)
-		unregisterPoolStats(c)
+		// A tick already in flight when Close started may have stored true.
+		c.healthy.Store(false)
+		c.metrics.releaseAvailability(c.labels)
+		c.metrics.pool.remove(c)
 	}
 
 	// Close connection pool

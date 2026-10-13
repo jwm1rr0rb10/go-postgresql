@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // WithPoolName names the pool in metrics and traces ("pool" label). Give each
@@ -15,6 +16,39 @@ import (
 func WithPoolName(name string) Option {
 	return func(cfg *Config) {
 		cfg.poolName = name
+	}
+}
+
+// WithFailureThreshold sets how many consecutive failed health pings turn the
+// client unhealthy (Healthy, the availability gauge, the HealthChecker and
+// Cluster routing). A single success restores it. Defaults to 3, so an outage
+// is detected within threshold × WithIntervalCheck.
+func WithFailureThreshold(n int) Option {
+	return func(cfg *Config) {
+		cfg.health.failureThreshold = n
+	}
+}
+
+// WithRegisterer registers the client's metrics with reg instead of
+// prometheus.DefaultRegisterer. Clients sharing a registerer share the
+// collectors. A nil reg disables metric registration.
+func WithRegisterer(reg prometheus.Registerer) Option {
+	return func(cfg *Config) {
+		cfg.registerer = reg
+	}
+}
+
+// WithMaxReplicationLag marks the client as a replica whose replay lag is
+// measured on every health check: Cluster.Replica skips it while the lag
+// exceeds d, and the lag is exported as postgres_replication_lag_seconds.
+// A lagging replica stays healthy for the HealthChecker.
+//
+// Lag is the age of the last replayed transaction while WAL is still being
+// replayed. A replica that lost its connection to the primary but replayed
+// everything it received reports 0: alert on pg_stat_wal_receiver for that.
+func WithMaxReplicationLag(d time.Duration) Option {
+	return func(cfg *Config) {
+		cfg.maxLag = d
 	}
 }
 

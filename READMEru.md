@@ -1,7 +1,7 @@
 испра# PSQL
 **Готовый к использованию в продакшене клиент PostgreSQL с повторными попытками, проверками работоспособности и оптимизацией для высоконагруженных сервисов Go**
 
-`psql` — это легковесная, проверенная в реальных условиях оболочка для [`github.com/jackc/pgx/v5/pgxpool`](https://github.com/jackc/pgx), которая предоставляет чистый, настраиваемый и высоконадежный клиент PostgreSQL.
+`psql` — это легковесная оболочка для [`github.com/jackc/pgx/v5/pgxpool`](https://github.com/jackc/pgx), которая предоставляет чистый, настраиваемый и высоконадежный клиент PostgreSQL.
 
 Он включает в себя интеллектуальное объединение соединений, автоматические повторные попытки с учетом дрожания, двойной мониторинг работоспособности, централизованную обработку ошибок и настройки по умолчанию, соответствующие продакшену — все, что вам нужно для высоконагруженных бэкендов без лишнего шаблонного кода.
 
@@ -20,7 +20,7 @@
 
 ## Особенности
 - Конфигурация без **шаблонов** благодаря мощному шаблону `Option`
-- Оптимизированные для производственной среды настройки по умолчанию (50/10 соединений, время жизни 1 час и т. д.)
+- Оптимизированные для производственной среды настройки по умолчанию (20/0 соединений, время жизни 1 час с jitter и т. д.)
 - Автоматические повторные попытки при сбоях соединения с учетом дрожания
 - Двухуровневый мониторинг состояния (пользовательский интерфейс + метрики)
 - Централизованные обработчики ошибок (`ErrCommit`, `ErrDoQuery` и т. д.)
@@ -33,7 +33,7 @@
 
 ## Installation
 ```bash
-go get github.com/jwm1rr0rb10/libraries/backend/golang/psql
+go get github.com/jwm1rr0rb10/go-postgresql
 ```
 
 ---
@@ -41,8 +41,8 @@ go get github.com/jwm1rr0rb10/libraries/backend/golang/psql
 The library depends on:
 
 - github.com/jackc/pgx/v5
-- github.com/jackc/pgx/v5/pgxpool
-- (optional) your own HealthChecker and metrics implementation
+- github.com/prometheus/client_golang
+- go.opentelemetry.io/otel
 
 After adding the module, run:
 ```bash
@@ -60,8 +60,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
-	"github.com/jwm1rr0rb10/libraries/backend/golang/psql"
+	"github.com/jackc/pgx/v5"
+	psql "github.com/jwm1rr0rb10/go-postgresql"
 )
 
 func main() {
@@ -114,15 +116,22 @@ func (h *MyHealth) SetStatus(name string, status bool, details interface{}) { /*
 cfg, _ := psql.NewConfig(dsn,
 	psql.WithHealthChecker("postgres-main", &MyHealth{}),
 	psql.WithIntervalCheck(15*time.Second),
+	psql.WithFailureThreshold(3), // неудачных пингов подряд до статуса "unhealthy"
 )
 ```
+
+Клиент становится unhealthy после `WithFailureThreshold` неудачных пингов подряд
+(по умолчанию 3) и восстанавливается после первого успешного. Пинг, не
+дождавшийся соединения из полностью занятого пула, статус не меняет: перегрузка —
+не авария, и иначе `Cluster` выкидывал бы реплики, а readiness-проба падала бы
+именно на пике нагрузки. Пинги не попадают в трейсы и метрики латентности.
 
 ---
 
 ## Основные концепции
 ### Шаблон «Конфигурация + Параметры»
 Вся конфигурация выполняется через `NewConfig(dsn, options...)`.
-Вы можете переопределить количество повторных попыток, настройки пула, проверки работоспособности, бинарный режим и т. д.
+Вы можете переопределить количество повторных попыток, настройки пула, проверки работоспособности, режим выполнения запросов и т. д.
 
 ### HealthChecker interface
 
@@ -167,6 +176,9 @@ clean := psql.PrettySQL(`
 | WithQueryExecMode          | Режим выполнения запросов pgx (CacheDescribe/Exec — для PgBouncer)      |
 | WithHealthChecker          | Прикрепить пользовательский отчет о состоянии здоровья                  |
 | WithIntervalCheck          | Установить интервал проверки работоспособности                          |
+| WithFailureThreshold       | Число неудачных пингов подряд до статуса unhealthy                      |
+| WithRegisterer             | Свой реестр Prometheus (nil отключает метрики)                          |
+| WithMaxReplicationLag      | Учитывать отставание реплики при маршрутизации в Cluster                |
 | WithConnectionPool         | Настройте размер пула и время жизни пула.                               |
 | "ErrCommit, ErrDoQuery..." | Обертки ошибок с контекстом                                             |
 | IsErrUniqueViolation       | Проверьте уникальность нарушения                                        |
@@ -229,6 +241,8 @@ cfg, _ := psql.NewConfig(dsn,
 - OpenTelemetry client spans for queries, batches and COPY via the global
   TracerProvider. `WithTracing(false)`, `WithTraceSQL(false)` to tune;
   `WithQueryTracer` adds your own pgx tracer.
+- Метрики регистрируются в `prometheus.DefaultRegisterer`; передайте
+  `psql.WithRegisterer(reg)` для своего реестра или `nil`, чтобы отключить их.
 
 ### Transactions
 ```go
@@ -245,14 +259,17 @@ cluster, _ := psql.NewCluster(primary, replica1, replica2)
 cluster.Replica().Query(ctx, ...) // healthy replica round-robin, falls back to primary
 cluster.Primary().Exec(ctx, ...)  // writes and read-your-writes
 ```
-Отставание реплик не отслеживается.
+Создавайте клиентов реплик с `psql.WithMaxReplicationLag(5*time.Second)`, чтобы
+измерять отставание при каждой проверке: `Replica()` пропускает реплику, пока она
+отстаёт сильнее, а значение экспортируется как
+`postgres_replication_lag_seconds`. Без опции отставание не отслеживается.
 
 ### Testability
 Зависьте от `psql.Querier` (его реализуют `*Client`, `pgx.Tx`, `*pgx.Conn`) и
 `psql.TxRunner` вместо `*psql.Client`, чтобы мокать базу.
 
 ### Benchmarks
-`go test -run '^$' -bench . ./pkg/golang/postgresql` (`-short` пропускает
+`go test -run '^$' -bench . ./...` (`-short` пропускает
 бенчмарк с embedded PostgreSQL).
 
 ## Тестирование

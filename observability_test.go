@@ -69,7 +69,7 @@ func TestQueryStatus(t *testing.T) {
 func histogramCount(t *testing.T, pool, query, status string) uint64 {
 	t.Helper()
 	var m dto.Metric
-	h := queryDuration.WithLabelValues(pool, query, status)
+	h := defaultMetrics().queryDuration.WithLabelValues(pool, query, status)
 	if err := h.(interface{ Write(*dto.Metric) error }).Write(&m); err != nil {
 		t.Fatal(err)
 	}
@@ -80,6 +80,7 @@ func newTestObserver(pool string, tracing, traceSQL bool) (*observer, *tracetest
 	rec := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
 	return &observer{
+		metrics:  defaultMetrics(),
 		pool:     pool,
 		tracer:   tp.Tracer("test"),
 		tracing:  tracing,
@@ -186,14 +187,14 @@ func TestBuildTracerChainsUserTracers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr := buildTracer(cfg, nil)
+	tr := buildTracer(cfg, defaultMetrics(), nil)
 	ctx := tr.TraceQueryStart(context.Background(), nil, pgx.TraceQueryStartData{SQL: "SELECT 1"})
 	tr.TraceQueryEnd(ctx, nil, pgx.TraceQueryEndData{})
 	if user.starts != 1 || user.ends != 1 {
 		t.Fatalf("user tracer calls = %d/%d", user.starts, user.ends)
 	}
 
-	if _, ok := buildTracer(&Config{poolName: "x"}, nil).(*observer); !ok {
+	if _, ok := buildTracer(&Config{poolName: "x"}, defaultMetrics(), nil).(*observer); !ok {
 		t.Fatal("without extra tracers the observer is used directly")
 	}
 }

@@ -54,6 +54,20 @@ func TestDoWithAttemptsContextCancel(t *testing.T) {
 	}
 }
 
+func TestDoWithAttemptsContextKeepsLastError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	root := errors.New("connection refused")
+	err := DoWithAttempts(ctx, rand.New(rand.NewPCG(6, 0)), func() error {
+		return root
+	}, 100, time.Second)
+
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, root) {
+		t.Fatalf("expected both the deadline and the last error, got %v", err)
+	}
+}
+
 func TestAddJitter(t *testing.T) {
 	r := rand.New(rand.NewPCG(4, 0))
 	base := 100 * time.Millisecond
